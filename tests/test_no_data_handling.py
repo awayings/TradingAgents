@@ -24,7 +24,12 @@ class TestLoadOhlcvNoPoison(unittest.TestCase):
     def setUp(self):
         self._tmp = os.path.join(os.path.dirname(__file__), "_tmp_cache")
         os.makedirs(self._tmp, exist_ok=True)
-        set_config({"data_cache_dir": self._tmp})
+        # Pin the price vendor to the one this test stubs; the no-poison rule
+        # under test is vendor-neutral.
+        set_config({
+            "data_cache_dir": self._tmp,
+            "data_vendors": {"technical_indicators": "yfinance"},
+        })
 
     def tearDown(self):
         for f in os.listdir(self._tmp):
@@ -52,6 +57,9 @@ class TestRouteToVendorSentinel(unittest.TestCase):
         def raises_no_data(symbol, *a, **k):
             raise NoMarketDataError(symbol, "GC=F", "no rows")
 
+        # The configured chain must name vendors present in the patched table,
+        # so it is set explicitly rather than left at the shipped default.
+        set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
         patched = {"yfinance": raises_no_data, "alpha_vantage": raises_no_data}
         with mock.patch.dict(
             interface.VENDOR_METHODS, {"get_stock_data": patched}, clear=False
@@ -74,6 +82,7 @@ class TestRouteToVendorSentinel(unittest.TestCase):
         def raises_unavailable(symbol, *a, **k):
             raise ValueError("ALPHA_VANTAGE_API_KEY environment variable is not set.")
 
+        set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
         patched = {"yfinance": raises_no_data, "alpha_vantage": raises_unavailable}
         with mock.patch.dict(
             interface.VENDOR_METHODS, {"get_stock_data": patched}, clear=False

@@ -8,8 +8,9 @@ hit the right instrument instead of failing/mismatching.
 import pandas as pd
 
 import tradingagents.agents.utils.agent_utils as au
+import tradingagents.dataflows.stockstats_utils as su
 import tradingagents.dataflows.yfinance_news as ynews
-import tradingagents.graph.trading_graph as tg
+from tradingagents.dataflows.config import set_config
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 
@@ -45,7 +46,10 @@ def test_fetch_returns_normalizes_symbol(monkeypatch):
             idx = pd.date_range(start="2025-01-02", periods=len(prices), freq="D")
             return pd.DataFrame({"Close": prices}, index=idx)
 
-    monkeypatch.setattr(tg.yf, "Ticker", FakeTicker)
+    # The realized-return fetch goes through the vendor layer, which resolves its
+    # backend from configuration — pin it so this stub is the one consulted.
+    set_config({"data_vendors": {"technical_indicators": "yfinance"}})
+    monkeypatch.setattr(su.yf, "Ticker", FakeTicker)
 
     # _fetch_returns does not use ``self``; call unbound to avoid building the graph.
     raw, alpha, days, resolved = TradingAgentsGraph._fetch_returns(

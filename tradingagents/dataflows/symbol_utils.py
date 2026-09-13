@@ -73,6 +73,78 @@ _ALIASES = {
 _YAHOO_SAFE = re.compile(r"^[A-Za-z0-9._\-\^=]+$")
 
 
+# --- A-share (通达信 / TDX) symbols ------------------------------------------
+#
+# The TDX vendor addresses A-shares by an explicit (market, code) pair, not by
+# a suffixed ticker, so a symbol has to be split before it can be queried. The
+# exchange is recoverable from a bare 6-digit code's leading digits — that is
+# what lets a user type ``600519`` with no qualifier. An explicit market — a
+# ``.SH``/``.SS``/``.SZ``/``.BJ`` suffix or a ``SH``/``SZ``/``BJ`` prefix —
+# always wins, which is the only way to reach the index codes that collide
+# with a stock code (``000001`` is 平安银行 on SZ but 上证指数 on SH).
+_A_SHARE_MARKET_BY_PREFIX = (
+    ("6", "SH"),  # 600/601/603/605 主板, 688 科创板
+    ("9", "SH"),  # 900xxx B 股
+    ("4", "BJ"),  # 430xxx 北交所
+    ("8", "BJ"),  # 830xxx/870xxx 北交所
+    ("0", "SZ"),  # 000/001/002/003 主板
+    ("2", "SZ"),  # 200xxx B 股
+    ("3", "SZ"),  # 300/301 创业板
+)
+
+_A_SHARE_SUFFIXES = {".SH": "SH", ".SS": "SH", ".SZ": "SZ", ".BJ": "BJ"}
+_A_SHARE_PREFIXES = {"SH": "SH", "SZ": "SZ", "BJ": "BJ"}
+
+_A_SHARE_CODE = re.compile(r"^\d{6}$")
+
+
+def resolve_a_share_symbol(raw: str) -> tuple[str, str] | None:
+    """Split a user symbol into a ``(market, code)`` pair, or None if it isn't A-share shaped.
+
+    Accepts the forms a user or another layer may hold::
+
+        600519          -> ("SH", "600519")   exchange inferred from the code
+        600519.SH       -> ("SH", "600519")
+        600519.SS       -> ("SH", "600519")   Yahoo's Shanghai suffix
+        000001.SZ       -> ("SZ", "000001")
+        000001.SH       -> ("SH", "000001")   the SSE Composite, not 平安银行
+        430047.BJ       -> ("BJ", "430047")
+        sh600519        -> ("SH", "600519")   broker prefix form
+
+    Market strings, not ``easy_tdx.Market`` enums, so this module stays purely
+    syntactic and import-free — the TDX layer maps them. Returns None for
+    anything else (US tickers, forex, crypto), leaving those to the Yahoo
+    convention in ``normalize_symbol``.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().upper().rstrip("+")
+    if not s:
+        return None
+
+    # Explicit market qualifier first: it is the only way to disambiguate an
+    # index code from the same-numbered stock on the other exchange.
+    for suffix, market in _A_SHARE_SUFFIXES.items():
+        if s.endswith(suffix):
+            code = s[: -len(suffix)]
+            return (market, code) if _A_SHARE_CODE.match(code) else None
+    if len(s) == 8 and s[:2] in _A_SHARE_PREFIXES:
+        code = s[2:]
+        return (_A_SHARE_PREFIXES[s[:2]], code) if _A_SHARE_CODE.match(code) else None
+
+    # Bare code: infer the exchange from the leading digits.
+    if _A_SHARE_CODE.match(s):
+        for prefix, market in _A_SHARE_MARKET_BY_PREFIX:
+            if s.startswith(prefix):
+                return (market, s)
+    return None
+
+
+def is_a_share_symbol(raw: str) -> bool:
+    """True when ``raw`` names an A-share (SH/SZ/BJ) symbol."""
+    return resolve_a_share_symbol(raw) is not None
+
+
 # Crypto quote currencies that all map to Yahoo's USD pair. Yahoo lists only
 # ``<BASE>-USD`` (not the USDT/USDC stablecoin pairs), so a broker symbol quoted
 # in any of these resolves to ``-USD`` (#982). Longest first so ``USDT``/``USDC``

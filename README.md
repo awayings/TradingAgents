@@ -148,6 +148,11 @@ export OPENROUTER_API_KEY=...      # OpenRouter
 export ALPHA_VANTAGE_API_KEY=...   # Alpha Vantage
 ```
 
+Market data needs no key: the default vendor is the local TDX (通达信) client,
+which talks straight to a public quote server. The keys above are only for LLM
+providers, plus Alpha Vantage if you select it as a data vendor and FRED for
+macro indicators.
+
 For Azure OpenAI, copy `.env.enterprise.example` to `.env.enterprise` and fill in your credentials.
 
 For AWS Bedrock, install the extra with `pip install ".[bedrock]"`, set `llm_provider: "bedrock"`, configure AWS credentials (environment variables, `~/.aws/credentials`, or an IAM role) and `AWS_DEFAULT_REGION`, and use a Bedrock model ID, e.g. `us.anthropic.claude-opus-4-8-v1:0`.
@@ -172,13 +177,40 @@ You will see a screen where you can select your desired tickers, analysis date, 
 
 ### Markets and tickers
 
-TradingAgents works with any market Yahoo Finance covers, using the exchange-suffixed ticker. Company identity and the alpha benchmark resolve automatically per market.
+Prices, indicators, fundamentals and news default to the **tdx** vendor (通达信),
+which covers mainland A-shares (Shanghai/Shenzhen/Beijing) and needs no API key.
+Company identity and the alpha benchmark resolve automatically per market.
+
+China A-shares — any of these forms works:
+
+- Bare code, exchange inferred from the prefix: `600519` (Kweichow Moutai),
+  `000001`, `300750`, `688981`
+- Explicit market: `600519.SH` · `600519.SS` · `000001.SZ` · `430047.BJ` · `sh600519`
+- Index codes collide with stock codes and so need a qualifier: `000001` is
+  平安银行 on Shenzhen, whereas `000001.SH` is the SSE Composite.
+
+Non-A-share markets stay available by pointing a category at `yfinance` or
+`alpha_vantage` (see `data_vendors` in `tradingagents/default_config.py`), either
+globally or in the config passed to `TradingAgentsGraph`:
+
+```python
+config = {"data_vendors": {"core_stock_apis": "yfinance",
+                           "technical_indicators": "yfinance",
+                           "fundamental_data": "yfinance",
+                           "news_data": "yfinance"}}
+```
 
 - US: `AAPL`, `SPY`
 - Hong Kong: `0700.HK` · Tokyo: `7203.T` · London: `AZN.L`
 - India: `RELIANCE.NS`, `.BO` · Canada: `.TO` · Australia: `.AX`
-- China A-shares: Shanghai `.SS`, Shenzhen `.SZ` (e.g. `600519.SS` for Kweichow Moutai)
 - Crypto: `BTC-USD`, `ETH-USD`
+
+Two coverage gaps are inherent to the tdx vendor, and both are answered with an
+explicit "unavailable" message rather than an empty result: it serves ticker news
+from 巨潮资讯网 filings, so `get_global_news` has no market-wide feed (macro
+context still comes from `get_macro_indicators`, which uses FRED), and it has no
+insider-filing feed. Configuring `news_data` back to `yfinance` or
+`alpha_vantage` restores both.
 
 <p align="center">
   <img src="assets/cli/cli_init.png" width="100%" style="display: inline-block; margin: 0 2%;">

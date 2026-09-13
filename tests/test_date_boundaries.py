@@ -41,7 +41,12 @@ def test_get_yfin_requests_inclusive_end(monkeypatch):
 
 @pytest.mark.unit
 def test_load_ohlcv_requests_inclusive_end(monkeypatch, tmp_path):
-    set_config({"data_cache_dir": str(tmp_path)})
+    # Pin the price vendor: the exclusive-``end`` request shape is yfinance's, and
+    # this test asserts the request it makes rather than the configured default.
+    set_config({
+        "data_cache_dir": str(tmp_path),
+        "data_vendors": {"technical_indicators": "yfinance"},
+    })
     captured = {}
 
     def fake_download(symbol, start, end, **kwargs):

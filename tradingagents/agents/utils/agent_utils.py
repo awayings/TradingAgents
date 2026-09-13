@@ -89,6 +89,41 @@ def _clean_identity_value(value: Any) -> str | None:
     return cleaned
 
 
+def _resolve_a_share_identity(ticker: str) -> dict:
+    """Identity for an A-share, read from the TDX vendor.
+
+    The company name comes from the quote snapshot rather than a profile
+    endpoint, and the industry from the symbol's board membership. Every field
+    is optional: whatever the vendor cannot supply is simply left out, and the
+    caller degrades to the fields that are present.
+    """
+    from tradingagents.dataflows.tdx_common import (
+        exchange_label,
+        industry_names,
+        quote_snapshot,
+    )
+
+    identity: dict[str, str] = {}
+
+    quote = quote_snapshot(ticker)
+    name = _clean_identity_value(quote.get("name"))
+    if name:
+        identity["company_name"] = name
+
+    exchange = exchange_label(ticker)
+    if exchange:
+        identity["exchange"] = exchange
+
+    # No sector/industry split exists on this source: the board tree yields one
+    # ordered industry classification (e.g. 酿酒 / 白酒), which
+    # ``build_instrument_context`` renders as "Industry: …".
+    industry = industry_names(ticker)
+    if industry:
+        identity["industry"] = " / ".join(industry)
+
+    return identity
+
+
 @functools.lru_cache(maxsize=256)
 def resolve_instrument_identity(ticker: str) -> dict:
     """Resolve deterministic identity metadata (company name, sector, …) for a ticker.
@@ -99,17 +134,24 @@ def resolve_instrument_identity(ticker: str) -> dict:
     the price action to a narrative and invent an identity that then cascaded
     through every downstream agent.
 
-    Best-effort by design: if yfinance is unavailable, rate-limited, or doesn't
+    Best-effort by design: if the vendor is unavailable, rate-limited, or doesn't
     recognise the ticker, we return ``{}`` and the caller falls back to
     ticker-only context rather than failing before analysis starts. Cached so
     the lookup happens at most once per ticker per process.
 
-    The symbol is normalized first (e.g. ``XAUUSD`` -> ``GC=F``) so identity
-    resolves for the same instrument the price path actually fetches (#983).
+    A-share tickers resolve through the TDX vendor and everything else through
+    yfinance, keyed off the symbol's shape rather than the price vendor config:
+    this lookup is best-effort metadata, and dispatching by shape keeps an
+    A-share from spending a rate-limited Yahoo request on a name the quote
+    server already holds. The yfinance path normalizes first (``XAUUSD`` ->
+    ``GC=F``) so identity resolves for the instrument the price path actually
+    fetches (#983).
     """
-    from tradingagents.dataflows.symbol_utils import normalize_symbol
+    from tradingagents.dataflows.symbol_utils import is_a_share_symbol, normalize_symbol
 
     try:
+        if is_a_share_symbol(ticker):
+            return _resolve_a_share_identity(ticker)
         info = yf.Ticker(normalize_symbol(ticker)).info or {}
     except Exception as exc:  # noqa: BLE001 — fail open, never block the run
         logger.debug("Could not resolve instrument identity for %s: %s", ticker, exc)

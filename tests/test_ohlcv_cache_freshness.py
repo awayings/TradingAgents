@@ -64,7 +64,12 @@ def test_load_ohlcv_refetches_stale_same_day_cache(tmp_path, monkeypatch):
     Without this, the unit tests above would still pass if the helper were never
     called from the real code path.
     """
-    monkeypatch.setattr(su, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
+    monkeypatch.setattr(su, "get_config", lambda: {
+        "data_cache_dir": str(tmp_path),
+        # Pin the price vendor so the seeded ``-YFin-`` cache file is the one
+        # read; the TTL logic under test is vendor-neutral.
+        "data_vendors": {"technical_indicators": "yfinance"},
+    })
     monkeypatch.setattr(su.pd.Timestamp, "today", staticmethod(lambda: TODAY))
 
     # Pre-seed the cache file load_ohlcv will look for, aged past the TTL.
@@ -94,7 +99,12 @@ def test_load_ohlcv_refetches_stale_same_day_cache(tmp_path, monkeypatch):
 @pytest.mark.unit
 def test_load_ohlcv_reuses_fresh_same_day_cache(tmp_path, monkeypatch):
     # Mirror image: a fresh cache must NOT trigger a download.
-    monkeypatch.setattr(su, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
+    monkeypatch.setattr(su, "get_config", lambda: {
+        "data_cache_dir": str(tmp_path),
+        # Pin the price vendor so the seeded ``-YFin-`` cache file is the one
+        # read; the TTL logic under test is vendor-neutral.
+        "data_vendors": {"technical_indicators": "yfinance"},
+    })
     monkeypatch.setattr(su.pd.Timestamp, "today", staticmethod(lambda: TODAY))
 
     start = (TODAY - pd.DateOffset(years=5)).strftime("%Y-%m-%d")

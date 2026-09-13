@@ -391,6 +391,18 @@ class TestTradingMemoryLogCore:
 
 class TestDeferredReflection:
 
+    @pytest.fixture(autouse=True)
+    def _pin_price_vendor(self):
+        """Pin the price vendor to the one these tests stub.
+
+        ``_fetch_returns`` resolves its vendor from configuration, so without
+        this the shipped default — rather than the test's ``yfinance.Ticker``
+        stub — decides which backend is consulted and the stub is never reached.
+        """
+        from tradingagents.dataflows.config import set_config
+
+        set_config({"data_vendors": {"technical_indicators": "yfinance"}})
+
     # update_with_outcome
 
     def test_update_replaces_pending_tag(self, tmp_path):

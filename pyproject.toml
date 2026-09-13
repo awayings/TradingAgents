@@ -31,6 +31,13 @@ dependencies = [
     "tqdm>=4.67.1",
     "typing-extensions>=4.14.0",
     "yfinance>=1.4.1",
+    # 通达信 (TDX) A-share market data — the default vendor for prices,
+    # indicators, fundamentals and news. Not on PyPI, so it is referenced from
+    # the sibling checkout; if this path does not resolve, install it directly
+    # with `pip install -e ../easy_tdx`. Note it pins `pandas<3`, so this
+    # dependency holds pandas on the 2.x line (the `pandas>=2.3.0` floor above
+    # is unaffected).
+    "easy-tdx @ file:///home/jason/projects/me/stock/easy_tdx",
 ]
 
 [project.optional-dependencies]

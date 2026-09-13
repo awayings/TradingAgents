@@ -1,7 +1,8 @@
 import logging
 import os
 import time
-from typing import Annotated
+from collections.abc import Callable
+from typing import Annotated, NamedTuple
 
 import pandas as pd
 import yfinance as yf
@@ -9,7 +10,11 @@ from stockstats import wrap
 from yfinance.exceptions import YFRateLimitError
 
 from .config import get_config
-from .symbol_utils import NoMarketDataError, normalize_symbol
+from .symbol_utils import (
+    NoMarketDataError,
+    normalize_symbol,
+    resolve_a_share_symbol,
+)
 from .utils import safe_ticker_component
 
 logger = logging.getLogger(__name__)
@@ -181,17 +186,164 @@ def _needs_same_day_refresh(data_file, curr_date_dt, today_date) -> bool:
     return time.time() - os.path.getmtime(data_file) > OHLCV_CACHE_TTL_SECONDS
 
 
-def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
+def _canonical_yfinance(symbol: str) -> str:
+    """Resolve a broker/forex symbol (XAUUSD+ -> GC=F) to Yahoo's convention."""
+    return normalize_symbol(symbol)
+
+
+def _canonical_tdx(symbol: str) -> str:
+    """Resolve an A-share symbol to this vendor's ``<code>.<MARKET>`` form.
+
+    Raises ``NoMarketDataError`` for anything else, so a US ticker asked of an
+    A-share-only vendor reports "no data" instead of being silently sent to a
+    quote server that would answer about a different instrument.
+    """
+    resolved = resolve_a_share_symbol(symbol)
+    if resolved is None:
+        raise NoMarketDataError(
+            symbol, symbol,
+            "not an A-share symbol — the tdx vendor covers SH/SZ/BJ listed "
+            "instruments only (e.g. 600519, 600519.SH, 000001.SZ)",
+        )
+    market_name, code = resolved
+    return f"{code}.{market_name}"
+
+
+def _fetch_ohlcv_yfinance(canonical: str, start_str: str, end_str: str) -> pd.DataFrame:
+    """Daily bars for ``canonical`` from Yahoo, dates as a ``Date`` column."""
+    downloaded = yf_retry(lambda: yf.download(
+        canonical,
+        start=start_str,
+        end=end_str,
+        multi_level_index=False,
+        progress=False,
+        auto_adjust=True,
+    ))
+    return _ensure_date_column(downloaded.reset_index())
+
+
+def _fetch_ohlcv_tdx(canonical: str, start_str: str, end_str: str) -> pd.DataFrame:
+    """Daily bars for ``canonical`` from a TDX quote server.
+
+    Imported lazily so this module keeps working in an environment where
+    ``easy_tdx`` is not installed and only the yfinance vendor is configured.
+    """
+    from .tdx_common import fetch_daily_bars
+
+    return fetch_daily_bars(canonical, start_str, end_str)
+
+
+class _OhlcvVendor(NamedTuple):
+    """How to name, canonicalize and fetch the OHLCV cache for one vendor.
+
+    ``tag`` is part of the cache filename, so two vendors never read each
+    other's file — they disagree on adjusted prices (Yahoo's ``auto_adjust``
+    vs TDX 前复权), and serving one's cache to the other would mix bases.
+    """
+
+    tag: str
+    canonicalize: Callable[[str], str]
+    fetch: Callable[[str, str, str], pd.DataFrame]
+
+
+# Insertion order is the tie-breaker for the "default" sentinel (no explicit
+# vendor configured) and mirrors VENDOR_METHODS order for get_indicators.
+_OHLCV_VENDORS: dict[str, _OhlcvVendor] = {
+    "tdx": _OhlcvVendor("TDX", _canonical_tdx, _fetch_ohlcv_tdx),
+    "yfinance": _OhlcvVendor("YFin", _canonical_yfinance, _fetch_ohlcv_yfinance),
+}
+
+
+def resolve_ohlcv_vendor() -> str:
+    """Which registered vendor backs OHLCV loads, from the ``technical_indicators`` chain.
+
+    Indicators are computed here rather than by a vendor, so the price history
+    they run on has to follow the same configured chain the router would use.
+    Only vendors in ``_OHLCV_VENDORS`` can serve it; an unregistered name is
+    skipped so a chain like ``"alpha_vantage"`` degrades to the default instead
+    of raising.
+
+    Note this single chain also feeds ``market_data_validator``, which verifies
+    the prices the market analyst was shown. Configuring ``core_stock_apis`` and
+    ``technical_indicators`` to *different* vendors therefore splits the prices
+    the snapshot cross-checks from the ones ``get_stock_data`` reports; keep the
+    two categories on the same vendor unless that divergence is intended.
+    """
+    chain = get_config().get("data_vendors", {}).get("technical_indicators", "default")
+    for name in (v.strip() for v in str(chain).split(",")):
+        if name in _OHLCV_VENDORS:
+            return name
+    return next(iter(_OHLCV_VENDORS))
+
+
+def _fetch_range_yfinance(canonical: str, start_str: str, end_str: str) -> pd.DataFrame:
+    """Bars in ``[start_str, end_str)`` via the Ticker history endpoint."""
+    frame = yf_retry(lambda: yf.Ticker(canonical).history(start=start_str, end=end_str))
+    # Drop the tz so dates compare against a naive cutoff and print cleanly.
+    if frame.index.tz is not None:
+        frame.index = frame.index.tz_localize(None)
+    return _ensure_date_column(frame.reset_index())
+
+
+def _fetch_range_tdx(canonical: str, start_str: str, end_str: str) -> pd.DataFrame:
+    """Bars in ``[start_str, end_str)`` from a TDX quote server."""
+    from .tdx_common import fetch_daily_bars
+
+    # fetch_daily_bars takes an inclusive end; this registry's contract is exclusive.
+    inclusive_end = (pd.Timestamp(end_str) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    return fetch_daily_bars(canonical, start_str, inclusive_end)
+
+
+# Range fetchers take an exclusive upper bound, matching yfinance's ``end``.
+_RANGE_FETCHERS: dict[str, Callable[[str, str, str], pd.DataFrame]] = {
+    "tdx": _fetch_range_tdx,
+    "yfinance": _fetch_range_yfinance,
+}
+
+
+def fetch_ohlcv_range(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    vendor: str | None = None,
+) -> pd.DataFrame:
+    """Daily bars over the inclusive window ``[start_date, end_date]``, oldest first.
+
+    Separate from ``load_ohlcv`` because it deliberately does the opposite thing:
+    no cache and no look-ahead cutoff. Its caller is the realized-return
+    settlement, which reads *forward* from a past trade date to see how the
+    position actually resolved (#1251) — exactly the window ``load_ohlcv``'s
+    ``curr_date`` filter would cut away.
+    """
+    vendor = vendor or resolve_ohlcv_vendor()
+    spec = _OHLCV_VENDORS[vendor]
+    canonical = spec.canonicalize(symbol)
+
+    # Fetchers take an exclusive upper bound, so step one day past the inclusive
+    # end_date to include that day's bar.
+    end_exclusive = (pd.Timestamp(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    return _RANGE_FETCHERS[vendor](canonical, start_date, end_exclusive)
+
+
+def load_ohlcv(symbol: str, curr_date: str, *, vendor: str | None = None) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
     Downloads 5 years of data up to today and caches per symbol. On
     subsequent calls the cache is reused. Rows after curr_date are
     filtered out so backtests never see future prices.
+
+    ``vendor`` picks the price source; the vendor-specific implementations pass
+    their own name so a multi-vendor fallback chain reaches the right backend
+    when the router retries. ``None`` resolves it from configuration.
     """
-    # Resolve broker/forex symbols (XAUUSD+ -> GC=F) to Yahoo's convention,
-    # then reject values that would escape the cache directory when
-    # interpolated into the cache filename (e.g. ``../../tmp/x``).
-    canonical = normalize_symbol(symbol)
+    vendor = vendor or resolve_ohlcv_vendor()
+    spec = _OHLCV_VENDORS[vendor]
+
+    # Canonicalize for the chosen vendor, then reject values that would escape
+    # the cache directory when interpolated into the cache filename (e.g.
+    # ``../../tmp/x``).
+    canonical = spec.canonicalize(symbol)
     safe_symbol = safe_ticker_component(canonical)
 
     config = get_config()
@@ -209,7 +361,7 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     os.makedirs(config["data_cache_dir"], exist_ok=True)
     data_file = os.path.join(
         config["data_cache_dir"],
-        f"{safe_symbol}-YFin-data-{start_str}-{end_str}.csv",
+        f"{safe_symbol}-{spec.tag}-data-{start_str}-{end_str}.csv",
     )
 
     # A cached file may be empty if a prior fetch failed (unknown symbol,
@@ -228,19 +380,11 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             data = cached
 
     if data is None:
-        downloaded = yf_retry(lambda: yf.download(
-            canonical,
-            start=start_str,
-            end=end_str,
-            multi_level_index=False,
-            progress=False,
-            auto_adjust=True,
-        ))
-        downloaded = _ensure_date_column(downloaded.reset_index())
+        downloaded = spec.fetch(canonical, start_str, end_str)
         # Only cache real data — never persist an empty frame.
         if downloaded.empty or "Close" not in downloaded.columns:
             raise NoMarketDataError(
-                symbol, canonical, "Yahoo Finance returned no rows"
+                symbol, canonical, f"{vendor} returned no rows"
             )
         downloaded.to_csv(data_file, index=False, encoding="utf-8")
         data = downloaded
@@ -299,8 +443,9 @@ class StockstatsUtils:
         curr_date: Annotated[
             str, "curr date for retrieving stock price data, YYYY-mm-dd"
         ],
+        vendor: str | None = None,
     ):
-        data = load_ohlcv(symbol, curr_date)
+        data = load_ohlcv(symbol, curr_date, vendor=vendor)
         df = wrap(data)
         df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
         curr_date_str = pd.to_datetime(curr_date).strftime("%Y-%m-%d")

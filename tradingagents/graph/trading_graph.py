@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import yfinance as yf
 from langgraph.prebuilt import ToolNode
 
 # Import the abstract tool methods from agent_utils
@@ -30,6 +29,7 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.symbol_utils import is_a_share_symbol
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
@@ -268,6 +268,12 @@ class TradingAgentsGraph:
         for suffix, benchmark in benchmark_map.items():
             if suffix and ticker_upper.endswith(suffix.upper()):
                 return benchmark
+        # A bare A-share code (``600519``) carries no suffix for the map to match,
+        # so it would otherwise take the empty-suffix entry — scoring a Shanghai
+        # listing against SPY. Checked after the suffix map so that a qualified
+        # A-share ticker (``600519.SS``) keeps its exchange-composite entry.
+        if is_a_share_symbol(ticker):
+            return self.config.get("benchmark_a_share", "000300.SH")
         return benchmark_map.get("", "SPY")
 
     def _fetch_returns(
@@ -284,18 +290,20 @@ class TradingAgentsGraph:
         the full holding window has not traded (#1169), or the symbol is delisted
         or unreachable.
         """
-        from tradingagents.dataflows.symbol_utils import normalize_symbol
+        from tradingagents.dataflows.stockstats_utils import fetch_ohlcv_range
 
         try:
             start = datetime.strptime(trade_date, "%Y-%m-%d")
             end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
             end_str = end.strftime("%Y-%m-%d")
 
-            # Normalize so the realized-return lookup hits the same instrument
-            # the analysis priced (e.g. XAUUSD -> GC=F) (#984). The benchmark is
-            # already a canonical Yahoo symbol from ``_resolve_benchmark``.
-            stock = yf.Ticker(normalize_symbol(ticker)).history(start=trade_date, end=end_str)
-            bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
+            # Read through the vendor layer so the lookup hits whichever source
+            # priced the analysis (TDX for A-shares) rather than a hardcoded one
+            # that may not even cover the instrument. The fetch canonicalizes the
+            # symbol per vendor, so ``ticker`` and the already-canonical
+            # ``benchmark`` from ``_resolve_benchmark`` both resolve correctly.
+            stock = fetch_ohlcv_range(ticker, trade_date, end_str)
+            bench = fetch_ohlcv_range(benchmark, trade_date, end_str)
 
             # Require the full holding window in both series. A rerun before it
             # has traded leaves the entry pending to retry next run, rather than
@@ -314,7 +322,7 @@ class TradingAgentsGraph:
             alpha = raw - bench_ret
             # The date of the last price bar used is when this outcome became
             # known — the point-in-time cutoff for injecting the lesson (#1251).
-            resolution_date = stock.index[holding_days].strftime("%Y-%m-%d")
+            resolution_date = stock["Date"].iloc[holding_days].strftime("%Y-%m-%d")
             return raw, alpha, holding_days, resolution_date
         except Exception as e:
             logger.warning(

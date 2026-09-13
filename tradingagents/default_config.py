@@ -136,11 +136,15 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # The configured value is the exact vendor chain — requests are NOT silently
     # routed to vendors you didn't choose. For ordered fallback, list several,
     # e.g. "yfinance,alpha_vantage". "default" uses all available vendors.
+    # Prices, indicators, fundamentals and news default to tdx (通达信), which
+    # covers mainland A-shares (SH/SZ/BJ) with no API key. Set a category to
+    # "yfinance" or "alpha_vantage" to restore non-A-share coverage, or list
+    # several for an ordered fallback, e.g. "tdx,yfinance".
     "data_vendors": {
-        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
-        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
-        "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance
-        "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+        "core_stock_apis": "tdx",            # Options: tdx, alpha_vantage, yfinance
+        "technical_indicators": "tdx",       # Options: tdx, alpha_vantage, yfinance
+        "fundamental_data": "tdx",           # Options: tdx, alpha_vantage, yfinance
+        "news_data": "tdx",                  # Options: tdx, alpha_vantage, yfinance
         "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
         "prediction_markets": "polymarket",  # Options: polymarket (keyless)
     },
@@ -167,4 +171,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
         ".SZ":  "399001.SZ",   # Shenzhen (SZSE Component)
         "":     "SPY",         # default for US-listed tickers (no suffix)
     },
+    # Baseline index for an A-share ticker typed without an exchange suffix
+    # (``600519``). Such a ticker carries no suffix for ``benchmark_map`` to
+    # match, so without this it would take the empty-suffix US default above and
+    # the reflection layer would score a Shanghai listing against the S&P 500.
+    # 沪深300 is the standard mainland benchmark.
+    "benchmark_a_share": "000300.SH",
 })

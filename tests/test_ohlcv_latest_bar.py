@@ -85,8 +85,16 @@ def test_fill_price_gaps_drops_nan_close_rows():
 # --- load_ohlcv end-to-end (with a mocked cache read) -----------------------
 
 def _run_load(monkeypatch, tmp_path, frame, curr_date):
-    """Drive load_ohlcv against a pre-seeded cache frame (no network)."""
-    monkeypatch.setattr(su, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
+    """Drive load_ohlcv against a pre-seeded cache frame (no network).
+
+    Pins the price vendor to yfinance so the seeded ``-YFin-`` cache file is the
+    one that gets read; the date/NaN handling under test is vendor-neutral and
+    shared by every loader.
+    """
+    monkeypatch.setattr(su, "get_config", lambda: {
+        "data_cache_dir": str(tmp_path),
+        "data_vendors": {"technical_indicators": "yfinance"},
+    })
     today = pd.Timestamp(curr_date)
     monkeypatch.setattr(su.pd.Timestamp, "today", staticmethod(lambda: today))
     start = (today - pd.DateOffset(years=5)).strftime("%Y-%m-%d")

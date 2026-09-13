@@ -19,6 +19,15 @@ from .errors import (
 )
 from .fred import get_macro_data as get_fred_macro_data
 from .polymarket import get_prediction_markets as get_polymarket_prediction_markets
+from .tdx_fundamentals import (
+    get_tdx_balance_sheet,
+    get_tdx_cashflow,
+    get_tdx_fundamentals,
+    get_tdx_income_statement,
+    get_tdx_insider_transactions,
+)
+from .tdx_news import get_tdx_global_news, get_tdx_news
+from .tdx_stock import get_tdx_indicators_window, get_tdx_stock_data
 from .y_finance import (
     get_balance_sheet as get_yfinance_balance_sheet,
     get_cashflow as get_yfinance_cashflow,
@@ -78,6 +87,7 @@ TOOLS_CATEGORIES = {
 }
 
 VENDOR_LIST = [
+    "tdx",
     "yfinance",
     "fred",
     "polymarket",
@@ -91,45 +101,57 @@ VENDOR_LIST = [
 # categories (prices, fundamentals, news) still raise so a broken primary is loud.
 OPTIONAL_CATEGORIES = {"macro_data", "prediction_markets"}
 
-# Mapping of methods to their vendor-specific implementations
+# Mapping of methods to their vendor-specific implementations. Insertion order
+# is the chain used by the "default" sentinel, so each tool lists the vendor
+# that actually specializes in it first: tdx covers A-shares (and is the
+# configured default for every category below), the others cover the rest.
 VENDOR_METHODS = {
     # core_stock_apis
     "get_stock_data": {
+        "tdx": get_tdx_stock_data,
         "alpha_vantage": get_alpha_vantage_stock,
         "yfinance": get_YFin_data_online,
     },
     # technical_indicators
     "get_indicators": {
+        "tdx": get_tdx_indicators_window,
         "alpha_vantage": get_alpha_vantage_indicator,
         "yfinance": get_stock_stats_indicators_window,
     },
     # fundamental_data
     "get_fundamentals": {
+        "tdx": get_tdx_fundamentals,
         "alpha_vantage": get_alpha_vantage_fundamentals,
         "yfinance": get_yfinance_fundamentals,
     },
     "get_balance_sheet": {
+        "tdx": get_tdx_balance_sheet,
         "alpha_vantage": get_alpha_vantage_balance_sheet,
         "yfinance": get_yfinance_balance_sheet,
     },
     "get_cashflow": {
+        "tdx": get_tdx_cashflow,
         "alpha_vantage": get_alpha_vantage_cashflow,
         "yfinance": get_yfinance_cashflow,
     },
     "get_income_statement": {
+        "tdx": get_tdx_income_statement,
         "alpha_vantage": get_alpha_vantage_income_statement,
         "yfinance": get_yfinance_income_statement,
     },
     # news_data
     "get_news": {
+        "tdx": get_tdx_news,
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
     },
     "get_global_news": {
+        "tdx": get_tdx_global_news,
         "yfinance": get_global_news_yfinance,
         "alpha_vantage": get_alpha_vantage_global_news,
     },
     "get_insider_transactions": {
+        "tdx": get_tdx_insider_transactions,
         "alpha_vantage": get_alpha_vantage_insider_transactions,
         "yfinance": get_yfinance_insider_transactions,
     },
