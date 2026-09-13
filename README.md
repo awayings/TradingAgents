@@ -205,12 +205,19 @@ config = {"data_vendors": {"core_stock_apis": "yfinance",
 - India: `RELIANCE.NS`, `.BO` · Canada: `.TO` · Australia: `.AX`
 - Crypto: `BTC-USD`, `ETH-USD`
 
-Two coverage gaps are inherent to the tdx vendor, and both are answered with an
-explicit "unavailable" message rather than an empty result: it serves ticker news
-from 巨潮资讯网 filings, so `get_global_news` has no market-wide feed (macro
-context still comes from `get_macro_indicators`, which uses FRED), and it has no
-insider-filing feed. Configuring `news_data` back to `yfinance` or
-`alpha_vantage` restores both.
+The tdx vendor serves ticker news from 巨潮资讯网 filings and market-wide news
+from the 东方财富网 7x24 快讯 feed — both keyless, mainland-hosted, and
+look-ahead safe. Its one remaining gap is the insider-filing feed, answered
+with an explicit "unavailable" message rather than an empty result; configuring
+`news_data` back to `yfinance` or `alpha_vantage` restores it.
+
+For A-share sentiment analysis, the 东方财富股吧 (guba.eastmoney.com) forum is
+fetched as the community-discussion block in place of Reddit/StockTwits, which
+are unreachable from mainland China without a proxy. Overseas sources (Reddit,
+Polymarket, FRED) can be restored by pointing `HTTP_PROXY`/`HTTPS_PROXY` at a
+local proxy in `.env` — `NO_PROXY` keeps the domestic vendors (cninfo,
+eastmoney, sina, tdx) on the direct path, so A-share data never depends on the
+proxy being up.
 
 <p align="center">
   <img src="assets/cli/cli_init.png" width="100%" style="display: inline-block; margin: 0 2%;">

@@ -1,21 +1,27 @@
-"""The tdx vendor's news tool, backed by 巨潮资讯网 (cninfo) announcements.
+"""The tdx vendor's news tools, backed by domestic Chinese sources.
 
-The TDX quote protocol carries no news feed, so this vendor's ticker news is the
-official disclosure record instead: 上交所/深交所 filings as republished by
-巨潮资讯网. That is a different genre from a newswire — it is what the company is
+The TDX quote protocol carries no news feed, so ticker news is the official
+disclosure record instead: 上交所/深交所 filings as republished by 巨潮资讯网
+(cninfo). That is a different genre from a newswire — it is what the company is
 legally obliged to say, not what journalists wrote — but it is authoritative and
 it is dated, which is what the look-ahead guard needs.
 
-There is no market-wide equivalent: cninfo is queried per issuer, so the global
-news tool reports that it is unavailable here rather than returning an empty
-page the news analyst might read as a quiet market.
+Market-wide news comes from the 东方财富 7x24 fast-news feed (东方财富网 7x24
+快讯), a keyless, mainland-hosted headline stream — the domestic stand-in for
+the Yahoo/Google news feeds this vendor replaces. It is queried cursor-wise,
+newest first, and trimmed to the requested look-back window, so a backtest
+never leaks headlines published after its trade date.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 from datetime import datetime
 from typing import Annotated
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import pandas as pd
 
@@ -31,6 +37,15 @@ logger = logging.getLogger(__name__)
 # year for a large cap and bounds the request count for a quiet one.
 _PAGE_SIZE = 30
 _MAX_PAGES = 4
+
+# 东方财富 7x24 fast news: one cursor-paged, keyless JSON feed of market-wide
+# headlines. ``req_trace`` is a required request marker; any millisecond value
+# serves. 100 items cover roughly half a day, so a week's window is a handful
+# of pages — capped so a quiet or misbehaving feed cannot page forever.
+_FASTNEWS_URL = "https://np-listapi.eastmoney.com/comm/web/getFastNewsList"
+_FASTNEWS_PAGE_SIZE = 100
+_FASTNEWS_MAX_PAGES = 12
+_FASTNEWS_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
 
 def _cninfo_client():
@@ -133,27 +148,109 @@ def get_tdx_news(
         return f"Error fetching news for {ticker}: {str(e)}"
 
 
+def _fast_news_page(sort_end: str, timeout: float) -> tuple[list[dict], str]:
+    """One page of the 7x24 feed: ``(items, next_cursor)``.
+
+    A failed fetch returns ``([], "")`` and logs — the caller turns an empty
+    first page into an explicit unavailable message rather than an empty report
+    the news analyst might read as a quiet market.
+    """
+    params = urlencode({
+        "client": "web",
+        "biz": "web_724",
+        "fastColumn": "102",
+        "sortEnd": sort_end,
+        "pageSize": _FASTNEWS_PAGE_SIZE,
+        "req_trace": int(time.time() * 1000),
+    })
+    req = Request(f"{_FASTNEWS_URL}?{params}", headers={"User-Agent": _FASTNEWS_UA})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    except Exception as exc:  # noqa: BLE001 — degrade to unavailable, never raise
+        logger.warning("Fast-news fetch failed: %s", exc)
+        return [], ""
+
+    data = payload.get("data") or {}
+    items = data.get("fastNewsList") or []
+    return items, data.get("sortEnd") or ""
+
+
 def get_tdx_global_news(
     curr_date: str,
     look_back_days: int | None = None,
     limit: int | None = None,
 ) -> str:
-    """Market-wide news is not served by this vendor.
+    """Market-wide headlines from the 东方财富 7x24 fast-news feed.
 
-    cninfo is queried per issuer, so there is no cross-market feed to return.
-    Explains the gap and points at the macro tool instead of returning an empty
-    report, which the news analyst would otherwise read as an absence of events.
+    Paged newest-first and trimmed to the look-back window (look-ahead safe:
+    a backtest window never sees headlines published after ``curr_date``).
+    Degrades to an informative message on failure — this tool is one vendor in
+    a routing chain, so it must not raise over a network blip.
     """
     config = get_config()
     if look_back_days is None:
         look_back_days = config["global_news_lookback_days"]
+    if limit is None:
+        limit = config["global_news_article_limit"]
 
-    start_dt = pd.Timestamp(curr_date) - pd.Timedelta(days=look_back_days)
-    return (
-        f"Global market news is not available from the tdx vendor for "
-        f"{start_dt.strftime('%Y-%m-%d')} to {curr_date}: it sources ticker news "
-        f"from 巨潮资讯网 filings, which are queried per issuer and have no "
-        f"market-wide equivalent. Macro context for this window is available "
-        f"from get_macro_indicators. Do not infer market-wide events from this "
-        f"message."
-    )
+    curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+    start_dt = curr_dt - pd.Timedelta(days=look_back_days).to_pytimedelta()
+
+    kept: list[dict] = []
+    seen = 0
+    cursor = ""
+    for _ in range(_FASTNEWS_MAX_PAGES):
+        items, cursor = _fast_news_page(cursor, timeout=10.0)
+        if not items:
+            break
+        seen += len(items)
+
+        for item in items:
+            published = pd.to_datetime(item.get("showTime"), errors="coerce")
+            pub_dt = None if pd.isna(published) else published.to_pydatetime()
+            if in_window(pub_dt, start_dt, curr_dt):
+                kept.append(item)
+                if len(kept) >= limit:
+                    break
+
+        if len(kept) >= limit:
+            break
+
+        # Newest-first cursor feed: stop once a page reaches back past the
+        # window — there is nothing older worth requesting.
+        oldest = pd.to_datetime(
+            [i.get("showTime") for i in items if i.get("showTime")], errors="coerce"
+        ).min()
+        if pd.notna(oldest) and oldest.to_pydatetime() < start_dt:
+            break
+        if not cursor:
+            break
+
+    start_label = start_dt.strftime("%Y-%m-%d")
+    if seen == 0:
+        return (
+            f"Global market news is currently unavailable from the tdx vendor "
+            f"(东方财富 7x24 fast-news feed could not be fetched). Do not infer "
+            f"market-wide events from this message; macro context for this "
+            f"window is available from get_macro_indicators."
+        )
+    if not kept:
+        return (
+            f"No global news found between {start_label} and {curr_date} "
+            f"(the feed served {seen} headline(s) outside that window)"
+        )
+
+    news_str = ""
+    for item in kept:
+        title = str(item.get("title") or item.get("summary") or "No title").strip()
+        news_str += f"### {title} (source: 东方财富网 7x24 快讯)\n"
+        summary = str(item.get("summary") or "").strip()
+        if summary and summary != title:
+            news_str += f"{summary}\n"
+        show_time = str(item.get("showTime") or "").strip()
+        if show_time:
+            news_str += f"Published: {show_time}\n"
+        news_str += "\n"
+
+    return f"## Global Market News, from {start_label} to {curr_date}:\n\n{news_str}"

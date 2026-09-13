@@ -527,11 +527,18 @@ def test_news_declines_a_non_a_share_symbol():
 
 @pytest.mark.unit
 def test_global_news_explains_the_gap_instead_of_returning_nothing():
+    """A failed fast-news fetch must degrade to an explicit unavailable
+    message that points at the macro tool — never an empty report the news
+    analyst could read as a quiet market."""
+    from unittest.mock import patch
+
+    from tradingagents.dataflows import tdx_news
     from tradingagents.dataflows.tdx_news import get_tdx_global_news
 
-    out = get_tdx_global_news("2026-09-13")
+    with patch.object(tdx_news, "urlopen", side_effect=OSError("net down")):
+        out = get_tdx_global_news("2026-09-13")
 
-    assert "not available" in out
+    assert "currently unavailable" in out
     assert "get_macro_indicators" in out  # points at what still works
 
 
