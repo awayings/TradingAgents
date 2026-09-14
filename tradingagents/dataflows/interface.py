@@ -187,6 +187,31 @@ def get_vendor(category: str, method: str = None) -> str:
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
+# How each vendor's news data is named in the analyst prompts. The sentiment
+# analyst introduces its pre-fetched headlines by source, so that name has to
+# follow the configured vendor: naming one vendor while injecting another's
+# data mis-attributes the source in the published report (the sentiment report
+# credited 巨潮 filings to "Yahoo Finance" after the news vendor moved to tdx).
+_NEWS_VENDOR_LABELS = {
+    "tdx": "巨潮资讯网 (cninfo) filings",
+    "yfinance": "Yahoo Finance",
+    "alpha_vantage": "Alpha Vantage",
+}
+
+def get_news_source_label(method: str = "get_news") -> str:
+    """Human-readable name of the vendor serving ``method``'s news data.
+
+    Reads the same config the router reads, so the label tracks the data. An
+    unrecognized vendor — including the "default" sentinel, which resolves to
+    a chain decided at call time — gets a vendor-neutral phrase rather than a
+    guess: a prompt that names the wrong source is worse than one that names
+    no source at all.
+    """
+    configured = get_vendor(get_category_for_method(method), method)
+    # A configured chain is served by its first entry when that entry has data.
+    primary = configured.split(",")[0].strip()
+    return _NEWS_VENDOR_LABELS.get(primary, "the configured news source")
+
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)

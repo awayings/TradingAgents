@@ -130,6 +130,65 @@ def test_sentiment_prompt_states_constraint(monkeypatch):
     assert "tool-call date ranges" not in text
 
 
+def _sentiment_prompt_text(monkeypatch) -> str:
+    """Rendered sentiment prompt with every network source stubbed out."""
+    from tradingagents.agents.schemas import SentimentBand, SentimentReport
+
+    monkeypatch.setattr(sentiment, "fetch_stocktwits_messages", lambda *a, **k: "st")
+    monkeypatch.setattr(sentiment, "fetch_reddit_posts", lambda *a, **k: "rd")
+    monkeypatch.setattr(sentiment.get_news, "func", lambda *a, **k: "news", raising=False)
+
+    captured = {}
+    llm = _capturing_llm(captured, SentimentReport(
+        overall_band=SentimentBand.NEUTRAL, overall_score=5.0,
+        confidence="low", narrative="n",
+    ))
+    sentiment.create_sentiment_analyst(llm)({
+        "company_of_interest": "NVDA", "trade_date": "2026-01-15",
+        "asset_type": "stock", "messages": [],
+    })
+    return _prompt_text(captured["prompt"])
+
+
+@pytest.mark.unit
+def test_sentiment_prompt_names_the_configured_news_vendor(monkeypatch):
+    """The news block's header must follow the configured vendor.
+
+    The block is pre-fetched through ``get_news``, whose vendor is configurable,
+    so a hard-coded vendor name outlives the switch that invalidates it — the
+    prompt then credits one source's data to another, and the report repeats
+    the mis-attribution downstream.
+    """
+    from tradingagents.dataflows.config import set_config
+
+    set_config({"data_vendors": {"news_data": "yfinance"}})
+    assert "Yahoo Finance" in _sentiment_prompt_text(monkeypatch)
+
+    set_config({"data_vendors": {"news_data": "tdx"}})
+    text = _sentiment_prompt_text(monkeypatch)
+    assert "巨潮资讯网 (cninfo) filings" in text
+    assert "Yahoo Finance" not in text
+
+
+@pytest.mark.unit
+def test_news_source_label_never_guesses_an_unrecognized_vendor():
+    from tradingagents.dataflows.config import set_config
+    from tradingagents.dataflows.interface import get_news_source_label
+
+    # "default" is a sentinel: the serving vendor is chosen at call time, so no
+    # single brand name is defensible.
+    set_config({"data_vendors": {"news_data": "default"}})
+    assert get_news_source_label() == "the configured news source"
+
+    # A configured chain is served by its first entry.
+    set_config({"data_vendors": {"news_data": "tdx,yfinance"}})
+    assert get_news_source_label() == "巨潮资讯网 (cninfo) filings"
+
+    # A future vendor this map does not know still gets a truthful header.
+    set_config({"data_vendors": {"news_data": "some_new_vendor"}})
+    assert get_news_source_label() == "the configured news source"
+
+
 @pytest.mark.unit
 def test_tool_using_analysts_keep_their_date_guidance():
     # The analysts that really do call tools keep the wording that anchors their

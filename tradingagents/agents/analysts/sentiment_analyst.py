@@ -8,7 +8,7 @@ Reddit/X/StockTwits content under prompt pressure (verified live).
 The redesigned agent pre-fetches three complementary data sources before
 the LLM is invoked and injects them into the prompt as structured blocks:
 
-  1. News headlines     — Yahoo Finance (institutional framing)
+  1. News headlines     — the configured news vendor (institutional framing)
   2. StockTwits messages — retail-trader posts indexed by cashtag, with
                            user-labeled Bullish/Bearish sentiment tags
   3. Reddit posts        — r/wallstreetbets, r/stocks, r/investing
@@ -46,6 +46,7 @@ from tradingagents.agents.utils.structured import (
     invoke_structured_or_freetext,
 )
 from tradingagents.dataflows.guba import fetch_guba_posts
+from tradingagents.dataflows.interface import get_news_source_label
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
 from tradingagents.dataflows.symbol_utils import is_a_share_symbol
@@ -75,6 +76,9 @@ def create_sentiment_analyst(llm):
         # returns a string (no exceptions surface from here), so the LLM
         # always sees something — either real data or a clear placeholder.
         news_block = get_news.func(ticker, start_date, end_date)
+        # Name that block's source from the same config the router read, so the
+        # prompt does not credit one vendor's data to another.
+        news_source_label = get_news_source_label()
         # Pass the analysis window so a historical run trims social posts to it
         # instead of leaking today's chatter into a backtest (#1220).
         stocktwits_block = fetch_stocktwits_messages(
@@ -94,6 +98,7 @@ def create_sentiment_analyst(llm):
             start_date=start_date,
             end_date=end_date,
             news_block=news_block,
+            news_source_label=news_source_label,
             stocktwits_block=stocktwits_block,
             reddit_block=reddit_block,
             guba_block=guba_block,
@@ -148,6 +153,7 @@ def _build_system_message(
     start_date: str,
     end_date: str,
     news_block: str,
+    news_source_label: str,
     stocktwits_block: str,
     reddit_block: str,
     guba_block: str = "",
@@ -169,7 +175,7 @@ Community discussion for this A-share stock. Engagement signal via read count an
 
 ## Data sources (pre-fetched, in this prompt)
 
-### News headlines — Yahoo Finance, past 7 days
+### News headlines — {news_source_label}, past 7 days
 Institutional framing. Fact-driven, slower-moving signal.
 
 <start_of_news>
