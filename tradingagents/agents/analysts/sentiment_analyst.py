@@ -79,19 +79,25 @@ def create_sentiment_analyst(llm):
         # Name that block's source from the same config the router read, so the
         # prompt does not credit one vendor's data to another.
         news_source_label = get_news_source_label()
-        # Pass the analysis window so a historical run trims social posts to it
-        # instead of leaking today's chatter into a backtest (#1220).
-        stocktwits_block = fetch_stocktwits_messages(
-            ticker, limit=30, start_date=start_date, end_date=end_date
-        )
-        reddit_block = fetch_reddit_posts(ticker, start_date=start_date, end_date=end_date)
-        # A-shares get the domestic forum as their community-discussion block;
-        # it only covers A-share symbols, so anything else keeps Reddit/StockTwits.
-        guba_block = (
-            fetch_guba_posts(ticker, start_date=start_date, end_date=end_date)
-            if is_a_share_symbol(ticker)
-            else ""
-        )
+        # Community discussion: 东方财富股吧 for A-shares, Reddit/StockTwits for
+        # everything else. The two are mutually exclusive — Guba covers A-share
+        # symbols only, and the overseas pair is both unreachable and empty for
+        # them: StockTwits answers 403 from Cloudflare, and Reddit answers 429
+        # to every A-share query (a ~130s backoff per ticker) before returning
+        # no posts. Measured over a real run, paying that cost bought zero
+        # signal, so an A-share analysis skips them outright.
+        if is_a_share_symbol(ticker):
+            stocktwits_block = ""
+            reddit_block = ""
+            guba_block = fetch_guba_posts(ticker, start_date=start_date, end_date=end_date)
+        else:
+            # Pass the analysis window so a historical run trims social posts to
+            # it instead of leaking today's chatter into a backtest (#1220).
+            stocktwits_block = fetch_stocktwits_messages(
+                ticker, limit=30, start_date=start_date, end_date=end_date
+            )
+            reddit_block = fetch_reddit_posts(ticker, start_date=start_date, end_date=end_date)
+            guba_block = ""
 
         system_message = _build_system_message(
             ticker=ticker,
@@ -158,7 +164,37 @@ def _build_system_message(
     reddit_block: str,
     guba_block: str = "",
 ) -> str:
-    """Assemble the sentiment-analyst system message with structured data blocks."""
+    """Assemble the sentiment-analyst system message with structured data blocks.
+
+    A section is emitted only for a block that was actually fetched: an A-share
+    run carries no StockTwits/Reddit section at all, so the prompt never asks
+    the model to weigh a source it was not given — and never invites it to
+    invent one.
+    """
+    stocktwits_section = (
+        f"""
+### StockTwits messages — retail-trader social platform indexed by cashtag
+Fast-moving signal. Each message carries a user-labeled sentiment tag (Bullish / Bearish / no-label) plus the message body.
+
+<start_of_stocktwits>
+{stocktwits_block}
+<end_of_stocktwits>
+"""
+        if stocktwits_block
+        else ""
+    )
+    reddit_section = (
+        f"""
+### Reddit posts — r/wallstreetbets, r/stocks, r/investing (past 7 days)
+Community discussion. Engagement signal via upvote score and comment count. Subreddit character matters (r/wallstreetbets is often contrarian/exuberant; r/stocks more measured; r/investing longer-term).
+
+<start_of_reddit>
+{reddit_block}
+<end_of_reddit>
+"""
+        if reddit_block
+        else ""
+    )
     guba_section = (
         f"""
 ### 东方财富股吧 (Eastmoney Guba) — A-share retail investor forum (past 7 days)
@@ -171,7 +207,52 @@ Community discussion for this A-share stock. Engagement signal via read count an
         if guba_block
         else ""
     )
-    return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on three complementary data sources that have already been collected for you.
+    # The community block is one forum for an A-share (股吧) and the overseas
+    # pair for everything else, so the confidence wording names the ones this
+    # run actually has.
+    community_note = (
+        "For an A-share the 股吧 block is the community source of record: a "
+        "missing or unavailable Guba block leaves the retail view unobserved "
+        "and must lower confidence."
+        if guba_block
+        else "A missing or unavailable StockTwits or Reddit block weakens "
+        "confidence accordingly."
+    )
+
+    guidance = []
+    if stocktwits_block:
+        guidance.append(
+            "**Read the StockTwits Bullish/Bearish ratio as a leading retail-sentiment signal.** A 70/30 bullish/bearish split is moderately bullish; ≥90/10 may indicate over-extension and contrarian risk; 50/50 is uncertainty. Sample size matters — base rates on the actual message count, not percentages alone."
+        )
+    if guba_block or reddit_block:
+        # Name only the engagement shapes this run can actually show, so an
+        # A-share prompt never explains how to read upvote counts it lacks.
+        examples = []
+        if reddit_block:
+            examples.append("A 400-upvote / 200-comment Reddit thread")
+        if guba_block:
+            examples.append("a Guba post with thousands of reads and dozens of replies")
+        guba_note = (
+            " For Guba, title-only threads must be read as topics of discussion, not positions."
+            if guba_block
+            else ""
+        )
+        guidance.append(
+            f"**Weight community posts by engagement.** {' or '.join(examples)} reflects community attention; a 3-upvote post is noise. Read the body excerpts for context — the title alone often misleads.{guba_note}"
+        )
+        guidance.append(
+            "**Look for divergences across sources.** If news framing is bearish but the community is overwhelmingly bullish, that mismatch is itself a signal — it can mean retail is leaning into a thesis the news flow has not caught up to (or vice versa, that retail is chasing while institutions are cautious). A community split between a bullish narrative and bearish price action is a divergence too."
+        )
+    guidance += [
+        "**Distinguish opinion from event.** A news headline (\"Nvidia announces $500M Corning deal\") is an event; a forum post (\"buying this, it is going to moon\") is opinion. Both are inputs but should be weighted differently in your conclusions.",
+        "**Identify recurring narrative themes.** What topic keeps coming up across sources? That's the dominant narrative driving current sentiment.",
+        f"**Be honest about data limits.** If one or more sources returned an \"<unavailable>\" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If a source is silent on the stock, say so. {community_note}",
+        "**Identify catalysts and risks** that emerge across sources — news of upcoming earnings, product launches, competitive threats, policy headlines, etc.",
+        "**Past sentiment is not predictive.** Frame your conclusions as signal for the trader to weigh alongside fundamentals and technicals, not as a price call.",
+    ]
+    numbered_guidance = "\n\n".join(f"{i}. {item}" for i, item in enumerate(guidance, 1))
+
+    return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on the data sources that have been collected for you below.
 
 ## Data sources (pre-fetched, in this prompt)
 
@@ -181,38 +262,10 @@ Institutional framing. Fact-driven, slower-moving signal.
 <start_of_news>
 {news_block}
 <end_of_news>
-
-### StockTwits messages — retail-trader social platform indexed by cashtag
-Fast-moving signal. Each message carries a user-labeled sentiment tag (Bullish / Bearish / no-label) plus the message body.
-
-<start_of_stocktwits>
-{stocktwits_block}
-<end_of_stocktwits>
-
-### Reddit posts — r/wallstreetbets, r/stocks, r/investing (past 7 days)
-Community discussion. Engagement signal via upvote score and comment count. Subreddit character matters (r/wallstreetbets is often contrarian/exuberant; r/stocks more measured; r/investing longer-term).
-
-<start_of_reddit>
-{reddit_block}
-<end_of_reddit>
-{guba_section}
+{stocktwits_section}{reddit_section}{guba_section}
 ## How to analyze this data (best practices)
 
-1. **Read the StockTwits Bullish/Bearish ratio as a leading retail-sentiment signal.** A 70/30 bullish/bearish split is moderately bullish; ≥90/10 may indicate over-extension and contrarian risk; 50/50 is uncertainty. Sample size matters — base rates on the actual message count, not percentages alone.
-
-2. **Look for cross-source divergences.** If news framing is bearish but StockTwits is overwhelmingly bullish, that mismatch is itself a signal — it can mean retail is leaning into a thesis the news flow hasn't caught up to (or vice versa, that retail is chasing while institutions are cautious).
-
-3. **Weight community posts by engagement.** A 400-upvote / 200-comment Reddit thread, or a Guba post with thousands of reads and dozens of replies, reflects community attention; a 3-upvote post is noise. Read the body excerpts for context — the title alone often misleads. For Guba, title-only threads must be read as topics of discussion, not positions.
-
-4. **Distinguish opinion from event.** A news headline ("Nvidia announces $500M Corning deal") is an event; a StockTwits post ("buying NVDA, this is going to moon") is opinion. Both are inputs but should be weighted differently in your conclusions.
-
-5. **Identify recurring narrative themes.** What topic keeps coming up across sources? That's the dominant narrative driving current sentiment.
-
-6. **Be honest about data limits.** If StockTwits returned only a handful of messages, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If the sources are silent on a given subreddit, say so. For A-shares the Guba block is the community source of record; a missing or unavailable Guba block weakens confidence just like a missing Reddit block does.
-
-7. **Identify catalysts and risks** that emerge across sources — news of upcoming earnings, product launches, competitive threats, macro headlines, etc.
-
-8. **Past sentiment is not predictive.** Frame your conclusions as signal for the trader to weigh alongside fundamentals and technicals, not as a price call.
+{numbered_guidance}
 
 ## Output fields
 
