@@ -320,27 +320,76 @@ def analyze(
     }
 
 
-def _heartbeat(progress: dict, total: int, started: float) -> None:
+def _run(
+    stock: Stock,
+    progress: dict,
+    trade_date: str,
+    analysts: tuple[str, ...],
+    config: dict,
+    out_dir: Path,
+    retries: int,
+) -> dict:
+    """Run one ticker, recording when the pool actually starts it.
+
+    ``ThreadPoolExecutor`` queues everything handed to it, so the submit loop
+    cannot tell a running ticker from a backlogged one — only the worker thread
+    can. Marking the start here is what keeps the heartbeat's in-flight line
+    and its ETA honest on a 100-name sweep.
+    """
+    label = f"{stock.code} {stock.name}"
+    with _state_lock:
+        progress["running"][label] = time.time()
+    try:
+        return analyze(stock, trade_date, analysts, config, out_dir, retries)
+    finally:
+        with _state_lock:
+            progress["running"].pop(label, None)
+
+
+def _eta_seconds(progress: dict, now: float, workers: int) -> float | None:
+    """Estimated wall-clock seconds until the queue drains, or None if unknown.
+
+    Built from the measured per-ticker duration divided by the worker count,
+    not from ``finished / elapsed``: each ticker occupies one worker, so
+    wall-clock ≈ thread-time / workers, and a completion rate reads several
+    times too slow through the whole first wave — the window where every
+    worker is still busy with its first ticker and nothing has finished yet,
+    which is exactly when a 100-name sweep says "预计剩余 594.0 分钟".
+    """
+    if not progress["durations"]:
+        return None
+    mean = sum(progress["durations"]) / len(progress["durations"])
+    finished = progress["completed"] + progress["failed"]
+    not_started = max(progress["pending"] - finished - len(progress["running"]), 0)
+    remaining = not_started * mean
+    # A ticker already in flight owes only the rest of its own slot.
+    for started_at in progress["running"].values():
+        remaining += max(mean - (now - started_at), 0)
+    return remaining / max(workers, 1)
+
+
+def _heartbeat(progress: dict, total: int, workers: int, started: float) -> None:
     """Log a periodic ETA line so an unattended run is legible in the morning."""
     while not _stop.wait(120):
+        now = time.time()
         with _state_lock:
-            # Only this run's completions inform the rate; resumed (skipped)
-            # tickers finished in seconds and would distort the ETA.
-            finished = progress["completed"] + progress["failed"]
-            elapsed = time.time() - started
-            rate = finished / elapsed if elapsed else 0
-            eta = (total - finished - progress["skipped"]) / rate / 60 if rate else 0
-            inflight = ", ".join(progress["inflight"]) or "-"
+            completed = progress["completed"]
+            failed = progress["failed"]
+            skipped = progress["skipped"]
+            running = ", ".join(progress["running"]) or "-"
+            running_count = len(progress["running"])
+            eta = _eta_seconds(progress, now, workers)
         logger.info(
-            "进度 %d/%d（完成 %d 失败 %d 跳过 %d），进行中: %s，已耗时 %.1f 分钟，预计剩余 %.1f 分钟",
-            finished + progress["skipped"],
+            "进度 %d/%d（完成 %d 失败 %d 跳过 %d），在跑 %d 只: %s，已耗时 %.1f 分钟，预计剩余 %s",
+            completed + failed + skipped,
             total,
-            progress["completed"],
-            progress["failed"],
-            progress["skipped"],
-            inflight,
-            elapsed / 60,
-            max(eta, 0),
+            completed,
+            failed,
+            skipped,
+            running_count,
+            running,
+            (now - started) / 60,
+            f"{eta / 60:.1f} 分钟" if eta is not None else "估算中（还没有完成的样本）",
         )
 
 
@@ -599,10 +648,22 @@ def main(argv: list[str]) -> int:
         else:
             pending.append(stock)
 
-    progress = {"completed": 0, "failed": 0, "skipped": skipped, "inflight": []}
+    progress = {
+        "completed": 0,
+        "failed": 0,
+        "skipped": skipped,
+        "pending": len(pending),
+        # Populated by the worker threads (_run), not by the submit loop:
+        # only a running thread knows its ticker has actually started.
+        "running": {},
+        # Per-ticker wall time of the finished ones, the basis for the ETA.
+        "durations": [],
+    }
     started = time.time()
     heartbeat = threading.Thread(
-        target=_heartbeat, args=(progress, len(pending) + skipped, started), daemon=True
+        target=_heartbeat,
+        args=(progress, len(pending) + skipped, args.workers, started),
+        daemon=True,
     )
     heartbeat.start()
 
@@ -615,10 +676,10 @@ def main(argv: list[str]) -> int:
             if _stop.is_set():
                 logger.warning("已中断，剩余 %d 只未派发。", len(pending) - len(futures))
                 break
-            with _state_lock:
-                progress["inflight"].append(f"{stock.code} {stock.name}")
             futures[
-                pool.submit(analyze, stock, trade_date, analysts, config, out_dir, args.retries)
+                pool.submit(
+                    _run, stock, progress, trade_date, analysts, config, out_dir, args.retries
+                )
             ] = stock
 
         # as_completed so each finished ticker is logged and persisted without
@@ -641,10 +702,10 @@ def main(argv: list[str]) -> int:
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             with _state_lock:
-                progress["inflight"].remove(f"{stock.code} {stock.name}")
                 if row["status"] == "done":
                     progress["completed"] += 1
                     results.append(row)
+                    progress["durations"].append(row["duration_s"])
                 else:
                     progress["failed"] += 1
                     failures.append(row)
