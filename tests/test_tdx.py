@@ -331,6 +331,20 @@ def fake_quote(monkeypatch):
     return _install
 
 
+# The live-profile tests must mean the same thing forever, so they pin the wall
+# clock. ``withhold_live_profile`` compares ``curr_date`` against the real today,
+# so a hardcoded date exercises the live branch only until that date arrives —
+# after which the same test silently switches to asserting the withheld branch.
+_TODAY = "2026-09-13"
+
+
+@pytest.fixture()
+def pinned_today(monkeypatch):
+    from tradingagents.dataflows import date_window
+
+    monkeypatch.setattr(date_window, "get_current_date", lambda: _TODAY)
+
+
 @pytest.mark.unit
 def test_fundamentals_profile_is_withheld_for_a_past_date(monkeypatch, fake_quote):
     """A live snapshot has no historical vintage, so a past run must not see it."""
@@ -348,10 +362,10 @@ def test_fundamentals_profile_is_withheld_for_a_past_date(monkeypatch, fake_quot
 
 
 @pytest.mark.unit
-def test_fundamentals_profile_serves_the_live_snapshot(fake_quote):
+def test_fundamentals_profile_serves_the_live_snapshot(pinned_today, fake_quote):
     from tradingagents.dataflows.tdx_fundamentals import get_tdx_fundamentals
 
-    out = get_tdx_fundamentals("600519", "2026-09-13")
+    out = get_tdx_fundamentals("600519", _TODAY)
 
     assert "贵州茅台" in out
     assert "酿酒 / 白酒" in out
@@ -359,13 +373,15 @@ def test_fundamentals_profile_serves_the_live_snapshot(fake_quote):
 
 
 @pytest.mark.unit
-def test_fundamentals_raises_when_the_snapshot_has_no_usable_fields(monkeypatch, fake_quote):
+def test_fundamentals_raises_when_the_snapshot_has_no_usable_fields(
+    monkeypatch, pinned_today, fake_quote
+):
     from tradingagents.dataflows.tdx_fundamentals import get_tdx_fundamentals
 
     fake_quote(rows={"name": None, "pe_dynamic": float("nan")}, industry=[], exchange="")
 
     with pytest.raises(NoMarketDataError):
-        get_tdx_fundamentals("600519", "2026-09-13")
+        get_tdx_fundamentals("600519", _TODAY)
 
 
 @pytest.mark.unit
